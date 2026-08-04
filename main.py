@@ -1,0 +1,279 @@
+import os
+import time
+import re
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
+
+# Import Gemini SDK
+from google import genai
+from google.genai import types
+import requests
+import redis
+import json
+
+load_dotenv()
+
+app = FastAPI(title="Yazi Chatbot API")
+
+# Setup Database Connection
+MYSQL_URL = os.getenv("MYSQL_URL")
+if not MYSQL_URL:
+    raise ValueError("MYSQL_URL is not set in environment variables.")
+
+engine = create_engine(MYSQL_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("Connected to Redis successfully.")
+except Exception as e:
+    print(f"Failed to connect to Redis: {e}")
+    redis_client = None
+
+class ChatHistory(Base):
+    __tablename__ = "chat_histories"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(255), index=True, nullable=False)
+    role = Column(String(50), nullable=False)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Booking(Base):
+    __tablename__ = "bookings"
+    id = Column(Integer, primary_key=True, index=True)
+    pnr = Column(String(20))
+    status = Column(String(50))
+    origin_iata = Column(String(3))
+    destination_iata = Column(String(3))
+    departure_date = Column(DateTime)
+    total = Column(String(50)) # Keeping simple as String
+    currency = Column(String(3))
+
+# Auto-create tables if they don't exist
+Base.metadata.create_all(bind=engine)
+
+def get_pnr_status(pnr: str) -> str:
+    """Queries the database to get the flight booking status for a given PNR."""
+    db = SessionLocal()
+    try:
+        booking = db.query(Booking).filter(Booking.pnr.like(f"%{pnr}%")).first()
+        if not booking:
+            return f"No booking found with PNR: {pnr}"
+        return f"PNR {pnr} is {booking.status}. Flight from {booking.origin_iata} to {booking.destination_iata} on {booking.departure_date}. Total cost: {booking.total} {booking.currency}."
+    except Exception as e:
+        return f"Error retrieving PNR status: {str(e)}"
+    finally:
+        db.close()
+
+def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1) -> str:
+    """Searches for available flights between two locations on specific dates. 
+    Args:
+        origin: IATA code of origin (e.g., MSP)
+        destination: IATA code of destination (e.g., NBO)
+        departure_date: Date in YYYY-MM-DD format
+        return_date: Optional return date in YYYY-MM-DD format for round trips.
+        adults: Number of adult passengers.
+    """
+    try:
+        url = "http://127.0.0.1:5000/api/amadeus/flights/flight-offers"
+        payload = {
+            "currencyCode": "USD",
+            "travelers": [{"id": str(i+1), "travelerType": "ADULT"} for i in range(adults)]
+        }
+        
+        if return_date:
+            payload["originDestinations"] = [
+                {
+                    "id": "1",
+                    "originLocationCode": origin,
+                    "destinationLocationCode": destination,
+                    "departureDateTimeRange": {"date": departure_date}
+                },
+                {
+                    "id": "2",
+                    "originLocationCode": destination,
+                    "destinationLocationCode": origin,
+                    "departureDateTimeRange": {"date": return_date}
+                }
+            ]
+        else:
+            payload["originLocationCode"] = origin
+            payload["destinationLocationCode"] = destination
+            payload["departureDate"] = departure_date
+        response = requests.post(url, json=payload, timeout=25)
+        
+        if response.status_code != 200:
+            return f"Failed to search flights. Server returned {response.status_code}."
+            
+        data = response.json().get("data", {})
+        offers = data.get("outboundOffers", []) or data.get("roundTripOffers", [])
+        
+        if not offers:
+            return "[]"
+            
+        import json
+        structured_offers = []
+        for offer in offers[:5]:
+            price = offer.get("price", {}).get("total", "Unknown")
+            currency = offer.get("price", {}).get("currency", "USD")
+            
+            itineraries = offer.get("itineraries", [])
+            if itineraries:
+                segments = itineraries[0].get("segments", [])
+                if segments:
+                    departure_time = segments[0].get("departure", {}).get("at", "Unknown")
+                    arrival_time = segments[-1].get("arrival", {}).get("at", "Unknown")
+                    airline = segments[0].get("carrierCode", "Unknown")
+                    stops = len(segments) - 1
+                    
+                    structured_offers.append({
+                        "airline": airline,
+                        "origin": origin,
+                        "destination": destination,
+                        "departure_time": departure_time,
+                        "arrival_time": arrival_time,
+                        "stops": stops,
+                        "price": price,
+                        "currency": currency
+                    })
+                    
+        return json.dumps(structured_offers)
+    except Exception as e:
+        return f"Error connecting to flight search service: {str(e)}"
+
+# Initialize Gemini Client
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+    print("WARNING: GEMINI_API_KEY is not set correctly.")
+
+# We pass the api key directly to the client if provided, else it looks in environment
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE" else None
+
+class ChatRequest(BaseModel):
+    message: str
+    senderId: str = "default"
+
+class RasaResponse(BaseModel):
+    recipient_id: str
+    text: str
+
+@app.post("/api/chat", response_model=List[RasaResponse])
+async def chat_endpoint(request: ChatRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini API Key is missing. Please configure it in .env")
+
+    db = SessionLocal()
+    try:
+        session_id = request.senderId
+        user_message = request.message
+        
+        # Save user message and fetch history
+        if redis_client:
+            user_msg_dict = {"role": "user", "message": user_message, "created_at": datetime.utcnow().isoformat()}
+            redis_client.rpush(f"chat_session:{session_id}", json.dumps(user_msg_dict))
+            redis_client.ltrim(f"chat_session:{session_id}", -40, -1)
+            redis_client.expire(f"chat_session:{session_id}", 86400)
+            
+            raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
+            history = [json.loads(msg) for msg in raw_history]
+        else:
+            db_user_msg = ChatHistory(session_id=session_id, role="user", message=user_message)
+            db.add(db_user_msg)
+            db.commit()
+            
+            history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(20).all()
+            history_objs.reverse()
+            history = [{"role": msg.role, "message": msg.message} for msg in history_objs]
+
+        # Build contents for Gemini history
+        contents = []
+        
+        # System instruction context
+        system_instruction = "You are a helpful travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, ask them for the origin, destination, and date, and then use the search_flights tool. VERY IMPORTANT: When you use the search_flights tool, it will return a JSON list of flight options. You MUST output this EXACT JSON data inside a markdown code block with the language `flight_options` so the UI can render it. For example: \n```flight_options\n[...json array here...]\n```\n Add a friendly text response before the code block."
+        
+        # We don't want to include the very last user message in the history parameter of chats.create
+        history_for_chat = history[:-1] if history else []
+        last_user_msg = history[-1]["message"] if history else user_message
+
+        for msg in history_for_chat:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append(
+                types.Content(role=role, parts=[types.Part.from_text(text=msg["message"])])
+            )
+
+        # Initialize Chat session with history and tools
+        models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
+        bot_text = None
+        
+        for model_name in models_to_try:
+            try:
+                print(f"Trying model: {model_name}")
+                chat = client.chats.create(
+                    model=model_name,
+                    history=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.7,
+                        tools=[get_pnr_status, search_flights]
+                    )
+                )
+                
+                response = chat.send_message(last_user_msg)
+                bot_text = response.text
+                print(f"Success with model: {model_name}")
+                break
+                
+            except Exception as api_err:
+                print(f"Failed on {model_name}: {api_err}. Trying next...")
+                continue
+        
+        if bot_text is None:
+            bot_text = "I'm currently busy due to high demand. Please wait a moment and try again."
+        
+        # Save bot response
+        if redis_client:
+            bot_msg_dict = {"role": "model", "message": bot_text, "created_at": datetime.utcnow().isoformat()}
+            redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+        else:
+            db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
+            db.add(db_bot_msg)
+            db.commit()
+
+        return [{"recipient_id": session_id, "text": bot_text}]
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in chat endpoint: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to process chat request: {str(e)}")
+    finally:
+        db.close()
+
+@app.get("/api/chat/history/{session_id}")
+async def get_chat_history(session_id: str):
+    if redis_client:
+        raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
+        history = [json.loads(msg) for msg in raw_history]
+        return {"success": True, "history": history}
+    else:
+        db = SessionLocal()
+        try:
+            history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(40).all()
+            history_objs.reverse()
+            history = [{"role": msg.role, "message": msg.message, "created_at": str(msg.created_at)} for msg in history_objs]
+            return {"success": True, "history": history}
+        finally:
+            db.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8001)
