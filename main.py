@@ -73,7 +73,7 @@ def get_pnr_status(pnr: str) -> str:
     finally:
         db.close()
 
-def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1) -> str:
+def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1, children: int = 0, infants: int = 0) -> str:
     """Searches for available flights between two locations on specific dates. 
     Args:
         origin: IATA code of origin (e.g., MSP)
@@ -81,12 +81,31 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         departure_date: Date in YYYY-MM-DD format
         return_date: Optional return date in YYYY-MM-DD format for round trips.
         adults: Number of adult passengers.
+        children: Number of child passengers.
+        infants: Number of infant passengers.
     """
     try:
         url = "http://127.0.0.1:5000/api/amadeus/flights/flight-offers"
+        
+        adults = int(adults)
+        children = int(children)
+        infants = int(infants)
+        
+        travelers = []
+        traveler_id = 1
+        for _ in range(adults):
+            travelers.append({"id": str(traveler_id), "travelerType": "ADULT"})
+            traveler_id += 1
+        for _ in range(children):
+            travelers.append({"id": str(traveler_id), "travelerType": "CHILD"})
+            traveler_id += 1
+        for _ in range(infants):
+            travelers.append({"id": str(traveler_id), "travelerType": "HELD_INFANT", "associatedAdultId": "1"})
+            traveler_id += 1
+            
         payload = {
             "currencyCode": "USD",
-            "travelers": [{"id": str(i+1), "travelerType": "ADULT"} for i in range(adults)]
+            "travelers": travelers
         }
         
         if return_date:
@@ -108,7 +127,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
             payload["originLocationCode"] = origin
             payload["destinationLocationCode"] = destination
             payload["departureDate"] = departure_date
-        response = requests.post(url, json=payload, timeout=25)
+        response = requests.post(url, json=payload, timeout=60)
         
         if response.status_code != 200:
             return f"Failed to search flights. Server returned {response.status_code}."
@@ -142,7 +161,10 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                         "arrival_time": arrival_time,
                         "stops": stops,
                         "price": price,
-                        "currency": currency
+                        "currency": currency,
+                        "adults": adults,
+                        "children": children,
+                        "infants": infants
                     })
                     
         return json.dumps(structured_offers)
@@ -197,7 +219,7 @@ async def chat_endpoint(request: ChatRequest):
         contents = []
         
         # System instruction context
-        system_instruction = "You are a helpful travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, ask them for the origin, destination, and date, and then use the search_flights tool. VERY IMPORTANT: When you use the search_flights tool, it will return a JSON list of flight options. You MUST output this EXACT JSON data inside a markdown code block with the language `flight_options` so the UI can render it. For example: \n```flight_options\n[...json array here...]\n```\n Add a friendly text response before the code block."
+        system_instruction = "You are a helpful travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, ask them for the origin, destination, and date, and then use the search_flights tool. VERY IMPORTANT: When you use the search_flights tool, it will return a JSON list of flight options. You MUST output this EXACT JSON data inside a markdown code block with the language `flight_options` so the UI can render it. Do NOT omit any keys; you must preserve `adults`, `children`, and `infants`. For example: \n```flight_options\n[...json array here...]\n```\n Add a friendly text response before the code block."
         
         # We don't want to include the very last user message in the history parameter of chats.create
         history_for_chat = history[:-1] if history else []
@@ -232,7 +254,8 @@ async def chat_endpoint(request: ChatRequest):
                 break
                 
             except Exception as api_err:
-                print(f"Failed on {model_name}: {api_err}. Trying next...")
+                print(f"Failed on {model_name}: {api_err}. Waiting 2s before trying next...")
+                time.sleep(2)
                 continue
         
         if bot_text is None:
@@ -273,6 +296,52 @@ async def get_chat_history(session_id: str):
         finally:
             db.close()
 
+
+@app.delete("/api/chat/history/{session_id}")
+async def delete_chat_history(session_id: str):
+    if redis_client:
+        redis_client.delete(f"chat_session:{session_id}")
+        return {"success": True, "message": "Deleted from Redis"}
+    else:
+        db = SessionLocal()
+        try:
+            db.execute(text(f"DELETE FROM chat_histories WHERE session_id='{session_id}'"))
+            db.commit()
+            return {"success": True, "message": "Deleted from Database"}
+        except Exception as e:
+            db.rollback()
+            return {"success": False, "error": str(e)}
+        finally:
+            db.close()
+
+@app.get("/api/chat/sessions")
+async def get_all_sessions():
+    sessions = []
+    if redis_client:
+        keys = redis_client.keys("chat_session:*")
+        for key in keys:
+            session_id = key.replace("chat_session:", "")
+            raw = redis_client.lindex(key, 0)
+            if raw:
+                msg = json.loads(raw)
+                sessions.append({"id": session_id, "preview": msg.get("message", "")[:40] + "...", "timestamp": msg.get("created_at")})
+        return {"success": True, "sessions": sessions}
+    else:
+        db = SessionLocal()
+        try:
+            # Using simple query to get sessions
+            result = db.execute(text("SELECT session_id, MIN(created_at) as timestamp FROM chat_histories GROUP BY session_id ORDER BY timestamp DESC LIMIT 50"))
+            for row in result:
+                s_id = row[0]
+                ts = row[1]
+                msg_row = db.execute(text(f"SELECT message FROM chat_histories WHERE session_id='{s_id}' ORDER BY id ASC LIMIT 1")).fetchone()
+                preview = msg_row[0][:40] + "..." if msg_row else "Previous Chat"
+                sessions.append({"id": s_id, "preview": preview, "timestamp": str(ts)})
+            return {"success": True, "sessions": sessions}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            db.close()
 
 if __name__ == "__main__":
     import uvicorn
