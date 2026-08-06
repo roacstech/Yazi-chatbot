@@ -85,6 +85,10 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         infants: Number of infant passengers.
     """
     try:
+        # Sanitize origin & destination IATA codes to uppercase 3-letter codes
+        origin = re.sub(r'[^A-Za-z]', '', str(origin))[-3:].upper()
+        destination = re.sub(r'[^A-Za-z]', '', str(destination))[-3:].upper()
+
         url = "http://127.0.0.1:5000/api/amadeus/flights/flight-offers"
         
         adults = int(adults)
@@ -164,7 +168,8 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                         "currency": currency,
                         "adults": adults,
                         "children": children,
-                        "infants": infants
+                        "infants": infants,
+                        "raw_offer": offer  # Full Amadeus offer object (includes id, itineraries, travelerPricings, etc.)
                     })
                     
         return json.dumps(structured_offers)
@@ -219,7 +224,7 @@ async def chat_endpoint(request: ChatRequest):
         contents = []
         
         # System instruction context
-        system_instruction = "You are a helpful travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, ask them for the origin, destination, and date, and then use the search_flights tool. VERY IMPORTANT: When you use the search_flights tool, it will return a JSON list of flight options. You MUST output this EXACT JSON data inside a markdown code block with the language `flight_options` so the UI can render it. Do NOT omit any keys; you must preserve `adults`, `children`, and `infants`. For example: \n```flight_options\n[...json array here...]\n```\n Add a friendly text response before the code block."
+        system_instruction = "You are an expert travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, use the search_flights tool with the origin IATA code, destination IATA code, and departure date (YYYY-MM-DD).\n\nCRITICAL MANDATORY INSTRUCTION FOR FLIGHT SEARCH:\nWhenever search_flights returns flight options, you MUST ALWAYS output the returned JSON flight options array inside a markdown code block tagged with `flight_options`. Do NOT say no direct flights are available or withhold results due to stops — ALWAYS output the flight_options code block containing the JSON array so the UI can render the flight cards!\nExample:\nHere are the available flight options:\n```flight_options\n[...json array here...]\n```"
         
         # We don't want to include the very last user message in the history parameter of chats.create
         history_for_chat = history[:-1] if history else []
