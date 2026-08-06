@@ -342,6 +342,7 @@ async def get_all_sessions():
             return {"success": False, "error": str(e)}
         finally:
             db.close()
+            
 
 if __name__ == "__main__":
     import uvicorn
