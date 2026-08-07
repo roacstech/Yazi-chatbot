@@ -350,6 +350,17 @@ async def chat_endpoint(request: ChatRequest):
         session_id = request.senderId
         user_message = request.message
         
+        # Check if user message is asking about queue list or tickets in queue
+        live_queue_context = ""
+        if any(w in user_message.lower() for w in ["queue", "tcket", "ticket", "pnrs"]):
+            q_info = extract_queue_info_from_message(user_message, request.userid)
+            if q_info:
+                live_queue_context = (
+                    f"\n\n=== LIVE REAL-TIME QUEUE DATA FROM AMADEUS API ===\n"
+                    f"{q_info}\n"
+                    f"CRITICAL INSTRUCTION: Use the above live data numbers and PNR list to answer the user's question directly!"
+                )
+        
         # Save user message and fetch history
         if redis_client:
             user_msg_dict = {"role": "user", "message": user_message, "created_at": datetime.utcnow().isoformat()}
