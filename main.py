@@ -192,6 +192,67 @@ def get_queue_list_status(queue_id: int = 8, userid: Optional[int] = None) -> st
             "error": str(e)
         })
 
+def format_pretty_date(d_val) -> str:
+    if not d_val:
+        return "N/A"
+    try:
+        if isinstance(d_val, str):
+            d_obj = datetime.strptime(d_val.split(" ")[0], "%Y-%m-%d")
+        else:
+            d_obj = d_val
+        return d_obj.strftime("%d %b %Y")
+    except Exception:
+        return str(d_val).split(" ")[0]
+
+def get_recent_agent_bookings(limit: int = 3) -> str:
+    """Queries the database to retrieve the travel agent's most recent flight bookings and trip details (PNR, status, route, departure date, total price). ALWAYS CALL THIS TOOL whenever the user asks for 'my last booking', 'last booking details', 'my recent bookings', 'show my bookings', 'recent trips', 'my trips', or 'my bookings'."""
+    db = SessionLocal()
+    try:
+        user_id = globals().get('_CURRENT_USER_ID')
+        base_filter = f"agent_userid = '{user_id}'" if user_id else "1=1"
+        
+        query_str = f"SELECT id, pnr, status, origin_iata, destination_iata, departure_date, created_at, total, currency FROM bookings WHERE {base_filter} ORDER BY id DESC LIMIT {int(limit)}"
+        result = db.execute(text(query_str)).fetchall()
+        
+        if not result:
+            return "No recent flight bookings found for your agent account."
+            
+        recent_list = []
+        text_lines = []
+        for row in result:
+            b_id, pnr, status, orig, dest, dep_date, created_at, total, curr = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
+            pnr_str = pnr or "N/A"
+            status_str = (status or "Held").upper()
+            orig_str = orig or ""
+            dest_str = dest or ""
+            dep_date_str = format_pretty_date(dep_date)
+            booked_on_str = format_pretty_date(created_at)
+            total_str = f"{total}" if total is not None else "0.00"
+            curr_str = curr or "USD"
+            
+            recent_list.append({
+                "id": b_id,
+                "pnr": pnr_str,
+                "status": status_str,
+                "origin": orig_str,
+                "destination": dest_str,
+                "departure_date": dep_date_str,
+                "booked_on": booked_on_str,
+                "total": total_str,
+                "currency": curr_str
+            })
+            text_lines.append(f"- **PNR**: `{pnr_str}` | **Status**: `{status_str}` | **Route**: {orig_str} ✈️ {dest_str} (Departure: {dep_date_str} • Booked: {booked_on_str}) | **Total**: ${total_str} {curr_str}")
+            
+        json_block = json.dumps(recent_list)
+        return (
+            f"Here are your {len(recent_list)} most recent flight booking details:\n\n"
+            f"```recent_bookings\n{json_block}\n```"
+        )
+    except Exception as e:
+        return f"Error retrieving recent bookings: {str(e)}"
+    finally:
+        db.close()
+
 def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1, children: int = 0, infants: int = 0) -> str:
     """Searches for available flights between two locations on specific dates. 
     Args:
@@ -204,9 +265,12 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         infants: Number of infant passengers.
     """
     try:
-        # Sanitize origin & destination IATA codes to uppercase 3-letter codes
-        origin = re.sub(r'[^A-Za-z]', '', str(origin))[-3:].upper()
-        destination = re.sub(r'[^A-Za-z]', '', str(destination))[-3:].upper()
+        # Robustly extract 3-letter IATA codes
+        iata_orig_match = re.search(r'\b([A-Za-z]{3})\b', str(origin))
+        origin = iata_orig_match.group(1).upper() if iata_orig_match else re.sub(r'[^A-Za-z]', '', str(origin))[-3:].upper()
+
+        iata_dest_match = re.search(r'\b([A-Za-z]{3})\b', str(destination))
+        destination = iata_dest_match.group(1).upper() if iata_dest_match else re.sub(r'[^A-Za-z]', '', str(destination))[-3:].upper()
 
         url = "http://127.0.0.1:5000/api/amadeus/flights/flight-offers"
         
@@ -291,7 +355,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                         "adults": adults,
                         "children": children,
                         "infants": infants,
-                        "raw_offer": offer  # Full Amadeus offer object (includes id, itineraries, travelerPricings, etc.)
+                        "raw_offer": offer
                     })
                     
         return json.dumps(structured_offers)
@@ -303,12 +367,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
     print("WARNING: GEMINI_API_KEY is not set correctly.")
 
-# We pass the api key directly to the client if provided, else it looks in environment
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE" else None
 
 def extract_queue_info_from_message(user_message: str, userid: Optional[str] = None) -> Optional[str]:
     lower_msg = user_message.lower()
-    if "queue" in lower_msg or "tcket" in lower_msg or "ticket" in lower_msg or "pnr" in lower_msg:
+    if "queue" in lower_msg or "tcket" in lower_msg or "ticket" in lower_msg or "pnrs" in lower_msg:
         queue_id = 5
         if "queue 8" in lower_msg or "queue8" in lower_msg:
             queue_id = 8
@@ -353,6 +416,31 @@ async def chat_endpoint(request: ChatRequest):
         session_id = request.senderId
         user_message = request.message
         
+        # Direct intent handler for recent booking inquiries (handles all singular/plural/flight variations)
+        lower_user_msg = user_message.lower().strip()
+        recent_booking_phrases = [
+            "booking details", "booking detail", "bookings", "booking",
+            "last booking", "last bookings", "recent booking", "recent bookings", 
+            "my booking", "my bookings", "show my booking", "show my bookings",
+            "last trip", "last trips", "recent trip", "recent trips", "my trip", "my trips",
+            "show my recent flight bookings", "show my recent bookings", "recent flight bookings", "last flight bookings"
+        ]
+        is_recent_query = any(phrase in lower_user_msg for phrase in recent_booking_phrases) or bool(re.search(r'\b(recent|last|my)\s*(flight\s*)?booking(s)?\b', lower_user_msg))
+        
+        if is_recent_query:
+            try:
+                rec_info = get_recent_agent_bookings(limit=3)
+                if rec_info:
+                    db_bot_msg = ChatHistory(session_id=session_id, role="model", message=rec_info)
+                    db.add(db_bot_msg)
+                    db.commit()
+                    if redis_client:
+                        bot_msg_dict = {"role": "model", "message": rec_info, "created_at": datetime.utcnow().isoformat()}
+                        redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+                    return [{"recipient_id": session_id, "text": rec_info}]
+            except Exception as rec_err:
+                print(f"Error fetching recent bookings: {rec_err}")
+
         # Check if user message is asking about queue list or tickets in queue
         live_queue_context = ""
         if any(w in user_message.lower() for w in ["queue", "tcket", "ticket", "pnrs"]):
@@ -390,8 +478,15 @@ async def chat_endpoint(request: ChatRequest):
             
             # Comprehensive System instruction context trained on all Yazi Agent Menus
             system_instruction = (
-                "You are the official AI Assistant for Yazi Traveler, a premier B2B Travel Management Platform dedicated to Travel Agents.\n"
-                "Your main goal is to assist Travel Agents in understanding and using all Agent Menus, navigation paths, flight search, booking workflows, and policies.\n\n"
+                "You are the official AI Assistant ('Yazi AI') for Yazi Traveler, a premier B2B Travel Management Platform dedicated to Travel Agents.\n"
+                "Your main goal is to assist Travel Agents in performing flight searches, booking workflows, queue monitoring, checking recent bookings, and answering platform questions.\n\n"
+                "=== CRITICAL MANDATORY ROLE & TOOL CALLING RULES ===\n"
+                "1. YOU ARE ALWAYS THE AI ASSISTANT ('Yazi AI'). THE USER IS ALWAYS THE HUMAN TRAVEL AGENT. NEVER SWAP ROLES OR pretend to be the travel agent asking the user to search flights!\n"
+                "2. RECENT BOOKINGS MANDATE: Whenever the user asks 'show my last booking details', 'my last booking', 'recent bookings', 'show my bookings', or 'my trips', YOU MUST IMMEDIATELY CALL THE `get_recent_agent_bookings` TOOL or report the exact recent booking details! NEVER execute a flight search when asked for last booking details!\n"
+                "3. FLIGHT SEARCH MANDATE: Whenever the user asks to search flights or provides a flight route and departure date (e.g., 'Search flights from MSP to NBO on departure date 2026-08-08' or 'book MSP to NBO'), YOU MUST IMMEDIATELY CALL THE `search_flights` TOOL! DO NOT OUTPUT CONVERSATIONAL TEXT WITHOUT EXECUTING THE `search_flights` TOOL!\n"
+                "4. PNR LOOKUP MANDATE:\n"
+                "   - If the user provides a 6-character PNR booking reference (e.g., C5PU5K), IMMEDIATELY call `get_pnr_status(pnr=...)`.\n"
+                "   - If the user says 'check pnr' or 'pnr' without a 6-character PNR code, ask directly: 'Please provide your 6-character PNR booking reference (e.g., C5PU5K) so I can look up its status for you.'\n\n"
                 "=== AGENT MENUS & APPLICATION STRUCTURE ===\n"
                 "The Yazi Traveler Agent portal consists of the following menus and sections in the sidebar navigation:\n\n"
                 "1. BOOKINGS\n"
@@ -462,7 +557,8 @@ async def chat_endpoint(request: ChatRequest):
                 "4. REPORT THE EXACT `total_tickets` AND `pnr_list` RETURNED BY `get_queue_list_status` DIRECTLY TO THE USER!\n"
                 "   Example: If `get_queue_list_status(queue_id=8)` returns `total_tickets: 4` and `pnr_list: ['BX383Y', 'BX9YNR', 'BXHK6A', 'C5PU5K']`, your response MUST be: 'There are currently 4 tickets in Queue 8 (Ticketing Time Limits): C5PU5K, BX383Y, BX9YNR, BXHK6A.'\n\n"
                 "=== TOOL CALLING INSTRUCTIONS ===\n"
-                "- If a user asks for PNR status, ALWAYS call the `get_pnr_status` tool.\n"
+                "- If a user asks for PNR status with a PNR code, ALWAYS call `get_pnr_status` tool.\n"
+                "- If a user asks for 'last booking details' or 'my recent bookings', ALWAYS call `get_recent_agent_bookings` tool.\n"
                 "- If a user asks to search for flights, call the `search_flights` tool with origin IATA, destination IATA, and departure date (YYYY-MM-DD).\n"
                 "- If a user asks for general dashboard stats ('today sales', 'total bookings', 'confirmed bookings'), call the `get_agent_dashboard_stats` tool.\n"
                 "- If a user asks about tickets or PNRs in Queue 8, Queue 5, Queue 0, Queue 2, Queue 12, Queue 23, or Queue List ('how many tickets in queue 8?'), ALWAYS call the `get_queue_list_status` tool with that `queue_id`!\n\n"
@@ -477,19 +573,32 @@ async def chat_endpoint(request: ChatRequest):
                 "Be clear, professional, concise, direct, and helpful. Always give direct answers with real live data numbers without unprompted navigation steps!"
             ) + live_queue_context
             
-            # We don't want to include the very last user message in the history parameter of chats.create
+            # Filter and build clean, strictly alternating history to eliminate roleplay hallucinations
             history_for_chat = history[:-1] if history else []
             last_user_msg = history[-1]["message"] if history else user_message
 
+            contents = []
+            last_role = None
             for msg in history_for_chat:
                 role = "user" if msg["role"] == "user" else "model"
                 msg_text = msg["message"]
+                
+                # Filter out corrupt role-reversal hallucination messages from past session history
+                if any(bad in msg_text.lower() for bad in ["role-reversal", "stuck in an assistant loop", "since you are my ai assistant", "proper roles: you're the travel agent"]):
+                    continue
+
                 if role == "model":
                     msg_text = re.sub(r'```flight_options[\s\S]*?```', '[Flight options listed]', msg_text)
+                    msg_text = re.sub(r'```recent_bookings[\s\S]*?```', '[Recent bookings listed]', msg_text)
                     msg_text = re.sub(r'\[\s*\{[\s\S]*?"airline"[\s\S]*?\}\s*\]', '[Flight options listed]', msg_text)
-                contents.append(
-                    types.Content(role=role, parts=[types.Part.from_text(text=msg_text)])
-                )
+                    msg_text = re.sub(r'\[\s*\{[\s\S]*?"pnr"[\s\S]*?\}\s*\]', '[Recent bookings listed]', msg_text)
+                
+                if role == last_role:
+                    if contents:
+                        contents[-1].parts[0].text += f"\n{msg_text}"
+                else:
+                    contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg_text)]))
+                    last_role = role
 
             # Initialize Chat session with history and tools
             models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
@@ -503,8 +612,8 @@ async def chat_endpoint(request: ChatRequest):
                         history=contents,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instruction,
-                            temperature=0.7,
-                            tools=[get_pnr_status, search_flights, get_agent_dashboard_stats, get_queue_list_status]
+                            temperature=0.2, # Lower temperature for strict tool execution
+                            tools=[get_pnr_status, search_flights, get_agent_dashboard_stats, get_queue_list_status, get_recent_agent_bookings]
                         )
                     )
                     
