@@ -21,7 +21,12 @@ load_dotenv()
 app = FastAPI(title="Yazi Chatbot API")
 
 # Setup Database Connection
-MYSQL_URL = os.getenv("MYSQL_URL")
+print("===== DEBUG ENV =====")
+print("MYSQL_URL:", os.environ.get("MYSQL_URL"))
+print("All env keys:", sorted(os.environ.keys()))
+print("=====================")
+
+MYSQL_URL = os.environ.get("MYSQL_URL")
 if not MYSQL_URL:
     raise ValueError("MYSQL_URL is not set in environment variables.")
 
