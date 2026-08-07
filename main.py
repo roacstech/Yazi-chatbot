@@ -37,7 +37,21 @@ engine = create_engine(MYSQL_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL")
+
+print("========== REDIS DEBUG ==========")
+print("REDIS_URL =", REDIS_URL)
+print("=================================")
+
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client.ping()
+    print("Connected to Redis successfully.")
+except Exception as e:
+    print(f"Failed to connect to Redis: {e}")
+    redis_client = None
+
+    
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     redis_client.ping()
