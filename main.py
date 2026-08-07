@@ -107,46 +107,49 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
             travelers.append({"id": str(traveler_id), "travelerType": "HELD_INFANT", "associatedAdultId": "1"})
             traveler_id += 1
             
+        origin_destinations = [
+            {
+                "id": "1",
+                "originLocationCode": origin,
+                "destinationLocationCode": destination,
+                "departureDateTimeRange": {"date": departure_date}
+            }
+        ]
+        if return_date:
+            origin_destinations.append({
+                "id": "2",
+                "originLocationCode": destination,
+                "destinationLocationCode": origin,
+                "departureDateTimeRange": {"date": return_date}
+            })
+            
         payload = {
             "currencyCode": "USD",
-            "travelers": travelers
+            "originDestinations": origin_destinations,
+            "travelers": travelers,
+            "searchCriteria": {"maxFlightOffers": 250}
         }
         
-        if return_date:
-            payload["originDestinations"] = [
-                {
-                    "id": "1",
-                    "originLocationCode": origin,
-                    "destinationLocationCode": destination,
-                    "departureDateTimeRange": {"date": departure_date}
-                },
-                {
-                    "id": "2",
-                    "originLocationCode": destination,
-                    "destinationLocationCode": origin,
-                    "departureDateTimeRange": {"date": return_date}
-                }
-            ]
-        else:
-            payload["originLocationCode"] = origin
-            payload["destinationLocationCode"] = destination
-            payload["departureDate"] = departure_date
         response = requests.post(url, json=payload, timeout=60)
         
         if response.status_code != 200:
             return f"Failed to search flights. Server returned {response.status_code}."
             
-        data = response.json().get("data", {})
-        offers = data.get("outboundOffers", []) or data.get("roundTripOffers", [])
-        
+        res_json = response.json()
+        data = res_json.get("data", {}) if isinstance(res_json, dict) else {}
+        offers = data.get("outboundOffers", []) or data.get("roundTripOffers", []) or data.get("flightOffers", [])
+        if not offers and isinstance(data, list):
+            offers = data
+            
         if not offers:
             return "[]"
             
         import json
         structured_offers = []
-        for offer in offers[:5]:
-            price = offer.get("price", {}).get("total", "Unknown")
-            currency = offer.get("price", {}).get("currency", "USD")
+        for offer in offers[:6]:
+            price_obj = offer.get("price", {})
+            price = price_obj.get("grandTotal") or price_obj.get("total", "Unknown")
+            currency = price_obj.get("currency", "USD")
             
             itineraries = offer.get("itineraries", [])
             if itineraries:
@@ -155,7 +158,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                     departure_time = segments[0].get("departure", {}).get("at", "Unknown")
                     arrival_time = segments[-1].get("arrival", {}).get("at", "Unknown")
                     airline = segments[0].get("carrierCode", "Unknown")
-                    stops = len(segments) - 1
+                    stops = max(0, len(segments) - 1)
                     
                     structured_offers.append({
                         "airline": airline,
@@ -164,7 +167,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                         "departure_time": departure_time,
                         "arrival_time": arrival_time,
                         "stops": stops,
-                        "price": price,
+                        "price": str(price),
                         "currency": currency,
                         "adults": adults,
                         "children": children,
@@ -220,48 +223,72 @@ async def chat_endpoint(request: ChatRequest):
             history_objs.reverse()
             history = [{"role": msg.role, "message": msg.message} for msg in history_objs]
 
-        # Build contents for Gemini history
-        contents = []
-        
-        # System instruction context
-        system_instruction = "You are an expert travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, use the search_flights tool with the origin IATA code, destination IATA code, and departure date (YYYY-MM-DD).\n\nCRITICAL MANDATORY INSTRUCTION FOR FLIGHT SEARCH:\nWhenever search_flights returns flight options, you MUST ALWAYS output the returned JSON flight options array inside a markdown code block tagged with `flight_options`. Do NOT say no direct flights are available or withhold results due to stops — ALWAYS output the flight_options code block containing the JSON array so the UI can render the flight cards!\nExample:\nHere are the available flight options:\n```flight_options\n[...json array here...]\n```"
-        
-        # We don't want to include the very last user message in the history parameter of chats.create
-        history_for_chat = history[:-1] if history else []
-        last_user_msg = history[-1]["message"] if history else user_message
+        # Check for simple greetings/casual chat first
+        GREETINGS = {"hi", "hello", "hey", "hlo", "hi there", "hello yazi", "good morning", "good afternoon", "good evening", "greetings", "help"}
+        cleaned_msg = user_message.strip().lower()
 
-        for msg in history_for_chat:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append(
-                types.Content(role=role, parts=[types.Part.from_text(text=msg["message"])])
+        if cleaned_msg in GREETINGS:
+            bot_text = "Hello! How can I assist you today with your flight search, booking, or PNR inquiry?"
+        else:
+            # Build contents for Gemini history
+            contents = []
+            
+            # System instruction context
+            system_instruction = (
+                "You are an expert travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies.\n\n"
+                "CRITICAL INSTRUCTIONS FOR CHAT:\n"
+                "- If the user's message is a simple greeting, thank you, or general chat (e.g., 'hi', 'hello', 'hey', 'thanks', 'ok', 'how are you'), DO NOT call search_flights or get_pnr_status. Respond politely asking how you can help them.\n"
+                "- If a user asks for a PNR, ALWAYS use the get_pnr_status tool.\n"
+                "- If a user wants to search for a flight, use the search_flights tool with origin IATA code, destination IATA code, and departure date (YYYY-MM-DD).\n\n"
+                "CRITICAL MANDATORY INSTRUCTION FOR FLIGHT SEARCH:\n"
+                "Whenever search_flights returns flight options, you MUST ALWAYS output the returned JSON flight options array inside a markdown code block tagged with `flight_options`.\n"
+                "Example:\n"
+                "Here are the available flight options:\n"
+                "```flight_options\n"
+                "[...json array here...]\n"
+                "```"
             )
+            
+            # We don't want to include the very last user message in the history parameter of chats.create
+            history_for_chat = history[:-1] if history else []
+            last_user_msg = history[-1]["message"] if history else user_message
 
-        # Initialize Chat session with history and tools
-        models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
-        bot_text = None
-        
-        for model_name in models_to_try:
-            try:
-                print(f"Trying model: {model_name}")
-                chat = client.chats.create(
-                    model=model_name,
-                    history=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.7,
-                        tools=[get_pnr_status, search_flights]
-                    )
+            for msg in history_for_chat:
+                role = "user" if msg["role"] == "user" else "model"
+                msg_text = msg["message"]
+                if role == "model":
+                    msg_text = re.sub(r'```flight_options[\s\S]*?```', '[Flight options listed]', msg_text)
+                    msg_text = re.sub(r'\[\s*\{[\s\S]*?"airline"[\s\S]*?\}\s*\]', '[Flight options listed]', msg_text)
+                contents.append(
+                    types.Content(role=role, parts=[types.Part.from_text(text=msg_text)])
                 )
-                
-                response = chat.send_message(last_user_msg)
-                bot_text = response.text
-                print(f"Success with model: {model_name}")
-                break
-                
-            except Exception as api_err:
-                print(f"Failed on {model_name}: {api_err}. Waiting 2s before trying next...")
-                time.sleep(2)
-                continue
+
+            # Initialize Chat session with history and tools
+            models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
+            bot_text = None
+            
+            for model_name in models_to_try:
+                try:
+                    print(f"Trying model: {model_name}")
+                    chat = client.chats.create(
+                        model=model_name,
+                        history=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            temperature=0.7,
+                            tools=[get_pnr_status, search_flights]
+                        )
+                    )
+                    
+                    response = chat.send_message(last_user_msg)
+                    bot_text = response.text
+                    print(f"Success with model: {model_name}")
+                    break
+                    
+                except Exception as api_err:
+                    print(f"Failed on {model_name}: {api_err}. Waiting 2s before trying next...")
+                    time.sleep(2)
+                    continue
         
         if bot_text is None:
             bot_text = "I'm currently busy due to high demand. Please wait a moment and try again."
