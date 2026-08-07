@@ -18,6 +18,9 @@ import json
 
 load_dotenv()
 
+print("MYSQL_URL =", os.getenv("MYSQL_URL"))
+print("REDIS_URL =", os.getenv("REDIS_URL"))
+
 app = FastAPI(title="Yazi Chatbot API")
 
 # Setup Database Connection
