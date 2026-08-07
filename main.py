@@ -350,17 +350,6 @@ async def chat_endpoint(request: ChatRequest):
         session_id = request.senderId
         user_message = request.message
         
-        # Check if user message is asking about queue list or tickets in queue
-        live_queue_context = ""
-        if any(w in user_message.lower() for w in ["queue", "tcket", "ticket", "pnrs"]):
-            q_info = extract_queue_info_from_message(user_message, request.userid)
-            if q_info:
-                live_queue_context = (
-                    f"\n\n=== LIVE REAL-TIME QUEUE DATA FROM AMADEUS API ===\n"
-                    f"{q_info}\n"
-                    f"CRITICAL INSTRUCTION: Use the above live data numbers and PNR list to answer the user's question directly. Do NOT say 2 or 0 if total_tickets is 4!"
-                )
-        
         # Save user message and fetch history
         if redis_client:
             user_msg_dict = {"role": "user", "message": user_message, "created_at": datetime.utcnow().isoformat()}
@@ -371,10 +360,6 @@ async def chat_endpoint(request: ChatRequest):
             raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
             history = [json.loads(msg) for msg in raw_history]
         else:
-            db_user_msg = ChatHistory(session_id=session_id, role="user", message=user_message)
-            db.add(db_user_msg)
-            db.commit()
-            
             history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(20).all()
             history_objs.reverse()
             history = [{"role": msg.role, "message": msg.message} for msg in history_objs]
@@ -511,14 +496,15 @@ async def chat_endpoint(request: ChatRequest):
         if bot_text is None:
             bot_text = "I'm currently busy due to high demand. Please wait a moment and try again."
         
-        # Save bot response
+        # Save bot response to DB (Permanent storage)
+        db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
+        db.add(db_bot_msg)
+        db.commit()
+        
+        # Save bot response to Redis
         if redis_client:
             bot_msg_dict = {"role": "model", "message": bot_text, "created_at": datetime.utcnow().isoformat()}
             redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
-        else:
-            db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
-            db.add(db_bot_msg)
-            db.commit()
 
         return [{"recipient_id": session_id, "text": bot_text}]
         
@@ -532,41 +518,45 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/api/chat/history/{session_id}")
 async def get_chat_history(session_id: str):
-    if redis_client:
-        raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
-        history = [json.loads(msg) for msg in raw_history]
-        return {"success": True, "history": history}
-    else:
-        db = SessionLocal()
-        try:
+    db = SessionLocal()
+    try:
+        history = []
+        if redis_client:
+            raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
+            if raw_history:
+                history = [json.loads(msg) for msg in raw_history]
+                
+        if not history:
             history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(40).all()
             history_objs.reverse()
             history = [{"role": msg.role, "message": msg.message, "created_at": str(msg.created_at)} for msg in history_objs]
-            return {"success": True, "history": history}
-        finally:
-            db.close()
+            
+        return {"success": True, "history": history}
+    finally:
+        db.close()
 
 
 @app.delete("/api/chat/history/{session_id}")
 async def delete_chat_history(session_id: str):
     if redis_client:
         redis_client.delete(f"chat_session:{session_id}")
-        return {"success": True, "message": "Deleted from Redis"}
-    else:
-        db = SessionLocal()
-        try:
-            db.execute(text(f"DELETE FROM chat_histories WHERE session_id='{session_id}'"))
-            db.commit()
-            return {"success": True, "message": "Deleted from Database"}
-        except Exception as e:
-            db.rollback()
-            return {"success": False, "error": str(e)}
-        finally:
-            db.close()
+        
+    db = SessionLocal()
+    try:
+        db.execute(text(f"DELETE FROM chat_histories WHERE session_id='{session_id}'"))
+        db.commit()
+        return {"success": True, "message": "Deleted from history"}
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()
 
 @app.get("/api/chat/sessions")
 async def get_all_sessions():
     sessions = []
+    seen_ids = set()
+    
     if redis_client:
         keys = redis_client.keys("chat_session:*")
         for key in keys:
@@ -575,23 +565,26 @@ async def get_all_sessions():
             if raw:
                 msg = json.loads(raw)
                 sessions.append({"id": session_id, "preview": msg.get("message", "")[:40] + "...", "timestamp": msg.get("created_at")})
-        return {"success": True, "sessions": sessions}
-    else:
-        db = SessionLocal()
-        try:
-            # Using simple query to get sessions
-            result = db.execute(text("SELECT session_id, MIN(created_at) as timestamp FROM chat_histories GROUP BY session_id ORDER BY timestamp DESC LIMIT 50"))
-            for row in result:
-                s_id = row[0]
-                ts = row[1]
+                seen_ids.add(session_id)
+                
+    db = SessionLocal()
+    try:
+        result = db.execute(text("SELECT session_id, MIN(created_at) as timestamp FROM chat_histories GROUP BY session_id ORDER BY timestamp DESC LIMIT 50"))
+        for row in result:
+            s_id = row[0]
+            ts = row[1]
+            if s_id not in seen_ids:
                 msg_row = db.execute(text(f"SELECT message FROM chat_histories WHERE session_id='{s_id}' ORDER BY id ASC LIMIT 1")).fetchone()
                 preview = msg_row[0][:40] + "..." if msg_row else "Previous Chat"
                 sessions.append({"id": s_id, "preview": preview, "timestamp": str(ts)})
-            return {"success": True, "sessions": sessions}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-        finally:
-            db.close()
+                seen_ids.add(s_id)
+                
+        sessions.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        return {"success": True, "sessions": sessions}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()
             
 
 if __name__ == "__main__":
