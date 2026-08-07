@@ -77,30 +77,30 @@ def get_agent_dashboard_stats() -> str:
     """Queries the database to retrieve live Agent Dashboard metrics (Total Bookings, Today's Sales, Active Queue Tickets, Pending PNRs, Confirmed, Cancelled). CALL THIS TOOL IMMEDIATELY whenever the user asks for total bookings, tickets in queue, queue list count, today's sales, pending PNRs, confirmed, cancelled, or dashboard stats."""
     db = SessionLocal()
     try:
-        total_trips = db.execute(text("SELECT COUNT(*) FROM bookings")).scalar() or 0
+        # Filter by current agent user just like the UI does!
+        user_id = globals().get('_CURRENT_USER_ID')
+        base_filter = f"agent_userid = '{user_id}'" if user_id else "1=1"
         
-        # Only count bookings as active queue tickets if status is 'held' or 'pending' AND not expired
+        total_trips = db.execute(text(f"SELECT COUNT(*) FROM bookings WHERE {base_filter}")).scalar() or 0
+        
         active_pending_pnrs = db.execute(text(
-            "SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('held', 'pending') AND (expires_at IS NULL OR expires_at > NOW())"
+            f"SELECT COUNT(*) FROM bookings WHERE LOWER(status) = 'held' AND {base_filter}"
         )).scalar() or 0
         
-        expired_pnrs = db.execute(text(
-            "SELECT COUNT(*) FROM bookings WHERE LOWER(status) = 'expired' OR (LOWER(status) IN ('held', 'pending') AND expires_at <= NOW())"
-        )).scalar() or 0
-
-        confirmed = db.execute(text("SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed')")).scalar() or 0
-        cancelled = db.execute(text("SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('cancelled', 'void')")).scalar() or 0
+        confirmed = db.execute(text(f"SELECT COUNT(*) FROM bookings WHERE LOWER(status) = 'ticketed' AND {base_filter}")).scalar() or 0
+        cancelled = db.execute(text(f"SELECT COUNT(*) FROM bookings WHERE LOWER(status) = 'cancelled' AND {base_filter}")).scalar() or 0
         
-        # Today's sales calculation
-        sales_val = db.execute(text("SELECT SUM(CAST(total AS DECIMAL(10,2))) FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed') AND DATE(created_at) = CURDATE()")).scalar()
+        # Today's sales calculation matching Node API
+        sales_val = db.execute(text(
+            f"SELECT SUM(CAST(total AS DECIMAL(10,2)) + CAST(COALESCE(price_adjustment, 0) AS DECIMAL(10,2))) "
+            f"FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed') AND DATE(held_at) = CURDATE() AND {base_filter}"
+        )).scalar()
         today_sales = float(sales_val) if sales_val is not None else 0.0
         
         stats = {
             "today_sales": f"${today_sales:.2f} USD",
-            "total_trips": int(total_trips),
-            "active_queue_tickets": int(active_pending_pnrs),
+            "total_bookings": int(total_trips),
             "pending_pnrs": int(active_pending_pnrs),
-            "expired_pnrs": int(expired_pnrs),
             "confirmed_bookings": int(confirmed),
             "cancelled_bookings": int(cancelled)
         }
