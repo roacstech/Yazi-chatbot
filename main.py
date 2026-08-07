@@ -73,6 +73,125 @@ def get_pnr_status(pnr: str) -> str:
     finally:
         db.close()
 
+def get_agent_dashboard_stats() -> str:
+    """Queries the database to retrieve live Agent Dashboard metrics (Total Bookings, Today's Sales, Active Queue Tickets, Pending PNRs, Confirmed, Cancelled). CALL THIS TOOL IMMEDIATELY whenever the user asks for total bookings, tickets in queue, queue list count, today's sales, pending PNRs, confirmed, cancelled, or dashboard stats."""
+    db = SessionLocal()
+    try:
+        total_trips = db.execute(text("SELECT COUNT(*) FROM bookings")).scalar() or 0
+        
+        # Only count bookings as active queue tickets if status is 'held' or 'pending' AND not expired
+        active_pending_pnrs = db.execute(text(
+            "SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('held', 'pending') AND (expires_at IS NULL OR expires_at > NOW())"
+        )).scalar() or 0
+        
+        expired_pnrs = db.execute(text(
+            "SELECT COUNT(*) FROM bookings WHERE LOWER(status) = 'expired' OR (LOWER(status) IN ('held', 'pending') AND expires_at <= NOW())"
+        )).scalar() or 0
+
+        confirmed = db.execute(text("SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed')")).scalar() or 0
+        cancelled = db.execute(text("SELECT COUNT(*) FROM bookings WHERE LOWER(status) IN ('cancelled', 'void')")).scalar() or 0
+        
+        # Today's sales calculation
+        sales_val = db.execute(text("SELECT SUM(CAST(total AS DECIMAL(10,2))) FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed') AND DATE(created_at) = CURDATE()")).scalar()
+        today_sales = float(sales_val) if sales_val is not None else 0.0
+        
+        stats = {
+            "today_sales": f"${today_sales:.2f} USD",
+            "total_trips": int(total_trips),
+            "active_queue_tickets": int(active_pending_pnrs),
+            "pending_pnrs": int(active_pending_pnrs),
+            "expired_pnrs": int(expired_pnrs),
+            "confirmed_bookings": int(confirmed),
+            "cancelled_bookings": int(cancelled)
+        }
+        return json.dumps(stats)
+    except Exception as e:
+        return json.dumps({
+            "today_sales": "$0.00 USD",
+            "total_trips": 0,
+            "active_queue_tickets": 0,
+            "pending_pnrs": 0,
+            "expired_pnrs": 0,
+            "confirmed_bookings": 0,
+            "cancelled_bookings": 0,
+            "note": "Unable to calculate live stats directly from database."
+        })
+    finally:
+        db.close()
+
+_CURRENT_USER_ID = None
+
+def get_queue_list_status(queue_id: int = 8, userid: Optional[int] = None) -> str:
+    """Queries the live Amadeus / Backend API to fetch real queue items and actual PNR count for a specific queue ID (e.g. Queue 8 for Ticketing Time Limits, Queue 5 for Ticketing Arrangements, Queue 0 for General Messages, Queue 2 for Schedule Changes, Queue 12 for Cancellations, Queue 23 for Quality Control). ALWAYS call this tool when user asks how many tickets/PNRs are in queue 8, queue 5, or any queue list."""
+    try:
+        global _CURRENT_USER_ID
+        effective_userid = userid if userid is not None else _CURRENT_USER_ID
+        q_id = int(queue_id)
+        url = f"http://127.0.0.1:5000/api/amadeus/flights/queues/{q_id}?category=0&max=250"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            res_data = response.json()
+            data_field = res_data.get("data", {})
+            if isinstance(data_field, dict):
+                pnr_list = data_field.get("data", [])
+            elif isinstance(data_field, list):
+                pnr_list = data_field
+            else:
+                pnr_list = []
+            
+            queue_names = {
+                5: "Ticketing Arrangements (Queue 5)",
+                8: "Ticketing Time Limits (Queue 8)",
+                0: "General Messages (Queue 0)",
+                2: "Schedule Changes (Queue 2)",
+                12: "Cancellations (Queue 12)",
+                23: "Quality Control (Queue 23)"
+            }
+            q_name = queue_names.get(q_id, f"Queue {q_id}")
+            
+            agent_pnrs = []
+            all_pnrs = []
+            
+            if isinstance(pnr_list, list):
+                for item in pnr_list:
+                    ref = item.get("reference")
+                    if ref:
+                        all_pnrs.append(ref)
+                        agent_info = item.get("agentInfo", {})
+                        a_id = agent_info.get("agent_userid")
+                        if a_id and (effective_userid is None or str(a_id) == str(effective_userid)):
+                            agent_pnrs.append(ref)
+                        elif agent_info and agent_info.get("agent_name") and agent_info.get("agent_name") != "Unknown Agent":
+                            agent_pnrs.append(f"{ref} ({agent_info.get('agent_name')})")
+
+            if effective_userid:
+                final_pnrs = agent_pnrs
+            else:
+                final_pnrs = agent_pnrs if agent_pnrs else all_pnrs
+                
+            count = len(final_pnrs)
+            
+            return json.dumps({
+                "queue_id": q_id,
+                "queue_name": q_name,
+                "total_tickets": count,
+                "pnr_list": final_pnrs
+            })
+        else:
+            return json.dumps({
+                "queue_id": q_id,
+                "total_tickets": 0,
+                "pnr_list": [],
+                "note": f"Queue API returned status {response.status_code}"
+            })
+    except Exception as e:
+        return json.dumps({
+            "queue_id": queue_id,
+            "total_tickets": 0,
+            "pnr_list": [],
+            "error": str(e)
+        })
+
 def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1, children: int = 0, infants: int = 0) -> str:
     """Searches for available flights between two locations on specific dates. 
     Args:
@@ -184,9 +303,35 @@ if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
 # We pass the api key directly to the client if provided, else it looks in environment
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY_HERE" else None
 
+def extract_queue_info_from_message(user_message: str, userid: Optional[str] = None) -> Optional[str]:
+    lower_msg = user_message.lower()
+    if "queue" in lower_msg or "tcket" in lower_msg or "ticket" in lower_msg or "pnr" in lower_msg:
+        queue_id = 5
+        if "queue 8" in lower_msg or "queue8" in lower_msg:
+            queue_id = 8
+        elif "queue 5" in lower_msg or "queue5" in lower_msg:
+            queue_id = 5
+        elif "queue 0" in lower_msg or "queue0" in lower_msg:
+            queue_id = 0
+        elif "queue 2" in lower_msg or "queue2" in lower_msg:
+            queue_id = 2
+        elif "queue 12" in lower_msg or "queue12" in lower_msg:
+            queue_id = 12
+        elif "queue 23" in lower_msg or "queue23" in lower_msg:
+            queue_id = 23
+            
+        try:
+            return get_queue_list_status(queue_id=queue_id, userid=userid)
+        except Exception as e:
+            return None
+    return None
+
 class ChatRequest(BaseModel):
     message: str
     senderId: str = "default"
+    auth: Optional[str] = None
+    roleid: Optional[str] = None
+    userid: Optional[str] = None
 
 class RasaResponse(BaseModel):
     recipient_id: str
@@ -197,10 +342,24 @@ async def chat_endpoint(request: ChatRequest):
     if not client:
         raise HTTPException(status_code=500, detail="Gemini API Key is missing. Please configure it in .env")
 
+    global _CURRENT_USER_ID
+    _CURRENT_USER_ID = request.userid
+
     db = SessionLocal()
     try:
         session_id = request.senderId
         user_message = request.message
+        
+        # Check if user message is asking about queue list or tickets in queue
+        live_queue_context = ""
+        if any(w in user_message.lower() for w in ["queue", "tcket", "ticket", "pnrs"]):
+            q_info = extract_queue_info_from_message(user_message, request.userid)
+            if q_info:
+                live_queue_context = (
+                    f"\n\n=== LIVE REAL-TIME QUEUE DATA FROM AMADEUS API ===\n"
+                    f"{q_info}\n"
+                    f"CRITICAL INSTRUCTION: Use the above live data numbers and PNR list to answer the user's question directly. Do NOT say 2 or 0 if total_tickets is 4!"
+                )
         
         # Save user message and fetch history
         if redis_client:
@@ -223,8 +382,94 @@ async def chat_endpoint(request: ChatRequest):
         # Build contents for Gemini history
         contents = []
         
-        # System instruction context
-        system_instruction = "You are an expert travel assistant for Yazi. Answer questions concisely and politely about flights, bookings, and travel policies. If a user asks for a PNR, ALWAYS use the get_pnr_status tool. If a user wants to search for a flight, use the search_flights tool with the origin IATA code, destination IATA code, and departure date (YYYY-MM-DD).\n\nCRITICAL MANDATORY INSTRUCTION FOR FLIGHT SEARCH:\nWhenever search_flights returns flight options, you MUST ALWAYS output the returned JSON flight options array inside a markdown code block tagged with `flight_options`. Do NOT say no direct flights are available or withhold results due to stops — ALWAYS output the flight_options code block containing the JSON array so the UI can render the flight cards!\nExample:\nHere are the available flight options:\n```flight_options\n[...json array here...]\n```"
+        # Comprehensive System instruction context trained on all Yazi Agent Menus
+        system_instruction = (
+            "You are the official AI Assistant for Yazi Traveler, a premier B2B Travel Management Platform dedicated to Travel Agents.\n"
+            "Your main goal is to assist Travel Agents in understanding and using all Agent Menus, navigation paths, flight search, booking workflows, and policies.\n\n"
+            "=== AGENT MENUS & APPLICATION STRUCTURE ===\n"
+            "The Yazi Traveler Agent portal consists of the following menus and sections in the sidebar navigation:\n\n"
+            "1. BOOKINGS\n"
+            "   - Flights (Path: /dashboard or /dashboard/flights):\n"
+            "     * Search live flights (One-Way, Round-Trip, Multi-City) across global airlines.\n"
+            "     * Filter results by departure/arrival times, stops (Non-stop, 1 stop, 2+ stops), and price in USD.\n"
+            "     * Select Fare Brands:\n"
+            "       - YBASIC: Economy Basic (Standard carry-on/checked baggage, change fees apply).\n"
+            "       - YVALUE: Economy Value (Standard baggage, date changes allowed).\n"
+            "       - YCOMFORT: Economy Comfort (Extra baggage, priority check-in & boarding, fully refundable options).\n"
+            "     * Review leg & layover breakdowns.\n"
+            "     * Enter passenger details (First Name, Last Name, Email, Phone, Passport Number, Passport Expiry).\n"
+            "     * Place Flight on Hold: Generates a PNR / Booking Reference and Hold Reference. Held bookings are automatically submitted to Queue List Management for Yazi Admin ticket approval and issuance.\n\n"
+            "2. TRIPS\n"
+            "   - Booking Details (Path: /dashboard/trips):\n"
+            "     * Overview of all agent flight bookings and trip reservations.\n"
+            "     * View booking status (e.g., ON HOLD, CONFIRMED, TICKETED, CANCELLED, EXPIRED).\n"
+            "     * Inspect detailed flight itineraries, passenger lists, and payment totals.\n"
+            "     * Actions: Print/Download E-Tickets & Itineraries, request trip modifications or cancellations.\n\n"
+            "   - Queue List Management (Path: /dashboard/queue):\n"
+            "     * Real-time monitoring of all queued PNR bookings.\n"
+            "     * Queue Categories:\n"
+            "       - Ticketing Arrangements (Queue 5): Bookings on hold awaiting ticket approval & issuance.\n"
+            "       - General Messages (Queue 0): System & airline notifications.\n"
+            "       - Schedule Changes (Queue 2): Airline-initiated flight time or route schedule changes.\n"
+            "       - Ticketing Time Limits (Queue 8): Deadlines for hold expiry to prevent cancellation.\n"
+            "       - Cancellations (Queue 12): Cancelled flight segments.\n"
+            "       - Quality Control (Queue 23): QC review records.\n"
+            "     * Track status chips (ON HOLD, PENDING, ISSUED) and hold expiry countdowns.\n\n"
+            "   - Reports (Path: /dashboard/overview or /dashboard/reports):\n"
+            "     * Business analytics and performance reports for the Travel Agent.\n"
+            "     * View total booking volume, revenue breakdown, commission earnings, monthly/yearly sales charts, and transaction history.\n\n"
+            "3. SETTINGS & STATUS\n"
+            "   - Settings (Path: /dashboard/settings):\n"
+            "     * The Settings page is dedicated to changing your account Password (Current Password, New Password, Confirm Password -> Save Changes).\n\n"
+            "   - Profile & Business Details (Path: /dashboard/profile):\n"
+            "     * Click your Avatar in the top right corner of the header and select 'View Profile' (or go to /dashboard/profile).\n"
+            "     * To update Profile Image: Click the camera icon badge on your avatar picture at the top of the profile page and upload your image.\n"
+            "     * To update Business Details & Address: Under the 'Business Information' section, click the 'Edit' button to update your Legal Business Name, Email, Phone, Country, State/Province, City, and Business Address.\n\n"
+            "   - Support (Path: /dashboard/support):\n"
+            "     * Customer help desk and agent assistance.\n"
+            "     * Submit support tickets, contact Yazi support team, view baggage policies, visa/passport guidance, and travel terms.\n\n"
+            "=== OFFICIAL YAZI TRAVELER CONTACT INFORMATION ===\n"
+            "If a user asks for contact details, phone number, email, or head office address for Yazi Admin or Support:\n"
+            "- Email: support@yazitravels.com\n"
+            "- Phone: +1 (320) 406-6287\n"
+            "- Head Office: 3417 3rd St N, Saint Cloud MN 56303, United States\n\n"
+            "=== CRITICAL MANDATORY DIRECT RESPONSE RULES ===\n"
+            "1. DIRECT ANSWERS FIRST: ALWAYS answer the user's question directly with the exact requested information (email, phone, stats, numbers, policies, answers).\n"
+            "2. DO NOT GIVE NAVIGATION INSTRUCTIONS: Do NOT output navigation steps ('Go to sidebar navigation... Click on X...'), UNLESS the user explicitly asks 'how do I navigate to...' or 'where is the menu located'.\n"
+            "3. CONTACT INQUIRIES: When a user asks how to contact admin, or asks for email/phone (e.g. 'how to contact admin give me a phone and email'), IMMEDIATELY answer directly:\n"
+            "   - Phone: +1 (320) 406-6287\n"
+            "   - Email: support@yazitravels.com\n"
+            "   - Head Office: 3417 3rd St N, Saint Cloud MN 56303, United States\n"
+            "4. PROFILE IMAGE & BUSINESS ADDRESS UPDATES:\n"
+            "   - When user asks 'how to update profile image or business details/address?':\n"
+            "     Explain clearly:\n"
+            "     1. Click your Avatar in the top-right header and select 'View Profile' (or go to /dashboard/profile).\n"
+            "     2. To update Profile Image: Click the camera icon badge on your avatar picture at the top of the profile page.\n"
+            "     3. To update Business Details & Address: Under 'Business Information', click the 'Edit' button to update Legal Business Name, Email, Phone, Country, State/Province, City, and Business Address.\n"
+            "5. PASSWORD UPDATES:\n"
+            "   - When user asks 'how to change password?': Explain to go to Settings (/dashboard/settings) -> enter Current Password, New Password, Confirm Password -> click 'Save Changes'.\n"
+            "=== CRITICAL MANDATORY QUEUE LIST TOOL RULE ===\n"
+            "Whenever the user asks about tickets in any queue list (such as 'how many tickets are in queue 8?', 'how many tickets in queue list?', 'queue 8 count', 'queue 5 count', 'how many tickets in queue list'):\n"
+            "1. YOU MUST EXCLUSIVELY CALL THE `get_queue_list_status` TOOL (pass queue_id=8 if asked about queue 8, or queue_id=5 if asked about queue 5 / ticketing arrangements / queue list).\n"
+            "2. DO NOT CALL `get_agent_dashboard_stats` FOR QUEUE SPECIFIC QUESTIONS.\n"
+            "3. DO NOT ANSWER 0 OR 2 FROM OLD MEMORY.\n"
+            "4. REPORT THE EXACT `total_tickets` AND `pnr_list` RETURNED BY `get_queue_list_status` DIRECTLY TO THE USER!\n"
+            "   Example: If `get_queue_list_status(queue_id=8)` returns `total_tickets: 4` and `pnr_list: ['BX383Y', 'BX9YNR', 'BXHK6A', 'C5PU5K']`, your response MUST be: 'There are currently 4 tickets in Queue 8 (Ticketing Time Limits): C5PU5K, BX383Y, BX9YNR, BXHK6A.'\n\n"
+            "=== TOOL CALLING INSTRUCTIONS ===\n"
+            "- If a user asks for PNR status, ALWAYS call the `get_pnr_status` tool.\n"
+            "- If a user asks to search for flights, call the `search_flights` tool with origin IATA, destination IATA, and departure date (YYYY-MM-DD).\n"
+            "- If a user asks for general dashboard stats ('today sales', 'total bookings', 'confirmed bookings'), call the `get_agent_dashboard_stats` tool.\n"
+            "- If a user asks about tickets or PNRs in Queue 8, Queue 5, Queue 0, Queue 2, Queue 12, Queue 23, or Queue List ('how many tickets in queue 8?'), ALWAYS call the `get_queue_list_status` tool with that `queue_id`!\n\n"
+            "CRITICAL MANDATORY INSTRUCTION FOR FLIGHT SEARCH:\n"
+            "Whenever search_flights returns flight options, you MUST ALWAYS output the returned JSON flight options array inside a markdown code block tagged with `flight_options` so the UI can render the flight cards!\n"
+            "Example:\n"
+            "Here are the available flight options:\n"
+            "```flight_options\n"
+            "[...json array here...]\n"
+            "```\n\n"
+            "=== RESPONSE STYLE ===\n"
+            "Be clear, professional, concise, direct, and helpful. Always give direct answers with real live data numbers without unprompted navigation steps!"
+        ) + live_queue_context
         
         # We don't want to include the very last user message in the history parameter of chats.create
         history_for_chat = history[:-1] if history else []
@@ -249,7 +494,7 @@ async def chat_endpoint(request: ChatRequest):
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=0.7,
-                        tools=[get_pnr_status, search_flights]
+                        tools=[get_pnr_status, search_flights, get_agent_dashboard_stats, get_queue_list_status]
                     )
                 )
                 
