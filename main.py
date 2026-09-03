@@ -567,8 +567,28 @@ async def chat_endpoint(request: ChatRequest):
                 orig_raw = flight_search_match.group(1)
                 dest_raw = flight_search_match.group(2)
                 date_raw = flight_search_match.group(3)
-                print(f"✈️ Direct flight search triggered: {orig_raw} -> {dest_raw} on {date_raw}")
-                flight_json_res = search_flights(origin=orig_raw, destination=dest_raw, departure_date=date_raw)
+
+                ret_match = re.search(r'return\s+date\s+(\d{4}-\d{2}-\d{2})', user_message, re.IGNORECASE)
+                ret_raw = ret_match.group(1) if ret_match else None
+
+                adults_match = re.search(r'(\d+)\s+adult', user_message, re.IGNORECASE)
+                children_match = re.search(r'(\d+)\s+child', user_message, re.IGNORECASE)
+                infants_match = re.search(r'(\d+)\s+infant', user_message, re.IGNORECASE)
+
+                parsed_adults = int(adults_match.group(1)) if adults_match else 1
+                parsed_children = int(children_match.group(1)) if children_match else 0
+                parsed_infants = int(infants_match.group(1)) if infants_match else 0
+
+                print(f"✈️ Direct flight search triggered: {orig_raw} -> {dest_raw} on {date_raw} (return={ret_raw}, adults={parsed_adults}, children={parsed_children}, infants={parsed_infants})")
+                flight_json_res = search_flights(
+                    origin=orig_raw,
+                    destination=dest_raw,
+                    departure_date=date_raw,
+                    return_date=ret_raw,
+                    adults=parsed_adults,
+                    children=parsed_children,
+                    infants=parsed_infants
+                )
                 if flight_json_res and flight_json_res != "[]" and not flight_json_res.startswith("Error") and not flight_json_res.startswith("Failed"):
                     bot_text = f"Here are the available flight options from {resolve_iata(orig_raw)} to {resolve_iata(dest_raw)} on {date_raw}:\n\n```flight_options\n{flight_json_res}\n```"
                     if db:
