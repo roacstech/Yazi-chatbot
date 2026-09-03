@@ -33,9 +33,7 @@ print("MYSQL_URL:", os.environ.get("MYSQL_URL"))
 print("All env keys:", sorted(os.environ.keys()))
 print("=====================")
 
-MYSQL_URL = os.environ.get("MYSQL_URL")
-if not MYSQL_URL:
-    raise ValueError("MYSQL_URL is not set in environment variables.")
+MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://root:Roacs2025@127.0.0.1:3306/yazi")
 
 engine = create_engine(MYSQL_URL, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -50,11 +48,11 @@ print("=================================")
 redis_client = None
 if REDIS_URL:
     try:
-        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1, socket_connect_timeout=1)
         redis_client.ping()
         print("Connected to Redis successfully.")
     except Exception as e:
-        print(f"Failed to connect to Redis: {e}")
+        print(f"Redis not available ({e}), using MySQL for history.")
         redis_client = None
 
 class ChatHistory(Base):
@@ -280,40 +278,92 @@ def get_recent_agent_bookings(limit: int = 3) -> str:
     except Exception as e:
         return f"Error retrieving recent bookings: {str(e)}"
 
+AIRPORT_MAP = {
+    "MINNEAPOLIS": "MSP",
+    "NAIROBI": "NBO",
+    "DUBAI": "DXB",
+    "LONDON": "LHR",
+    "NEW YORK": "JFK",
+    "CHICAGO": "ORD",
+    "DALLAS": "DFW",
+    "ATLANTA": "ATL",
+    "LOS ANGELES": "LAX",
+    "SAN FRANCISCO": "SFO",
+    "MOGADISHU": "MGQ",
+    "HARGEISA": "HGA",
+    "JIGJIGA": "JIJ",
+    "ADDIS ABABA": "ADD",
+    "CAIRO": "CAI",
+    "DOHA": "DOH",
+    "ISTANBUL": "IST",
+    "TORONTO": "YYZ",
+    "FRANKFURT": "FRA",
+    "PARIS": "CDG",
+    "SEATTLE": "SEA",
+    "BOSTON": "BOS",
+    "WASHINGTON": "IAD"
+}
+
+def resolve_iata(code_or_city: str) -> str:
+    if not code_or_city:
+        return "MSP"
+    val = str(code_or_city).strip().upper()
+    if val in AIRPORT_MAP:
+        return AIRPORT_MAP[val]
+    for city, iata in AIRPORT_MAP.items():
+        if city in val or val in city:
+            return iata
+    iata_match = re.search(r'\b([A-Za-z]{3})\b', val)
+    if iata_match:
+        return iata_match.group(1).upper()
+    return re.sub(r'[^A-Za-z]', '', val)[:3].upper()
+
 def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1, children: int = 0, infants: int = 0) -> str:
     """Searches for available flights between two locations on specific dates. 
     Args:
-        origin: IATA code of origin (e.g., MSP)
-        destination: IATA code of destination (e.g., NBO)
-        departure_date: Date in YYYY-MM-DD format
+        origin: IATA code or city of origin (e.g., MSP or Minneapolis)
+        destination: IATA code or city of destination (e.g., NBO or Nairobi)
+        departure_date: Date in YYYY-MM-DD format (e.g., 2026-08-15)
         return_date: Optional return date in YYYY-MM-DD format for round trips.
         adults: Number of adult passengers.
         children: Number of child passengers.
         infants: Number of infant passengers.
     """
     try:
-        # Robustly extract 3-letter IATA codes
-        iata_orig_match = re.search(r'\b([A-Za-z]{3})\b', str(origin))
-        origin = iata_orig_match.group(1).upper() if iata_orig_match else re.sub(r'[^A-Za-z]', '', str(origin))[-3:].upper()
+        origin = resolve_iata(origin)
+        destination = resolve_iata(destination)
 
-        iata_dest_match = re.search(r'\b([A-Za-z]{3})\b', str(destination))
-        destination = iata_dest_match.group(1).upper() if iata_dest_match else re.sub(r'[^A-Za-z]', '', str(destination))[-3:].upper()
+        # Normalize departure_date format
+        date_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', str(departure_date))
+        if date_match:
+            departure_date = date_match.group(1)
+
+        print(f"✈️ [Chatbot] Executing flight search: {origin} -> {destination} on {departure_date} (return={return_date})")
 
         url = f"{BACKEND_API_URL}/api/amadeus/flights/flight-offers"
         
-        adults = int(adults)
-        children = int(children)
-        infants = int(infants)
+        try:
+            adults_cnt = int(adults) if adults is not None else 1
+        except Exception:
+            adults_cnt = 1
+        try:
+            children_cnt = int(children) if children is not None else 0
+        except Exception:
+            children_cnt = 0
+        try:
+            infants_cnt = int(infants) if infants is not None else 0
+        except Exception:
+            infants_cnt = 0
         
         travelers = []
         traveler_id = 1
-        for _ in range(adults):
+        for _ in range(adults_cnt):
             travelers.append({"id": str(traveler_id), "travelerType": "ADULT"})
             traveler_id += 1
-        for _ in range(children):
+        for _ in range(children_cnt):
             travelers.append({"id": str(traveler_id), "travelerType": "CHILD"})
             traveler_id += 1
-        for _ in range(infants):
+        for _ in range(infants_cnt):
             travelers.append({"id": str(traveler_id), "travelerType": "HELD_INFANT", "associatedAdultId": "1"})
             traveler_id += 1
             
@@ -326,11 +376,13 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
             }
         ]
         if return_date:
+            ret_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', str(return_date))
+            clean_ret = ret_match.group(1) if ret_match else str(return_date)
             origin_destinations.append({
                 "id": "2",
                 "originLocationCode": destination,
                 "destinationLocationCode": origin,
-                "departureDateTimeRange": {"date": return_date}
+                "departureDateTimeRange": {"date": clean_ret}
             })
             
         payload = {
@@ -341,9 +393,11 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         }
         
         response = requests.post(url, json=payload, timeout=60)
+        print(f"✈️ [Chatbot] Flight Search API Status: {response.status_code}")
         
         if response.status_code != 200:
-            return f"Failed to search flights. Server returned {response.status_code}."
+            print(f"❌ [Chatbot] Flight Search Error Response: {response.text[:300]}")
+            return f"Failed to search flights. Server returned {response.status_code}: {response.text[:150]}"
             
         res_json = response.json()
         data = res_json.get("data", {}) if isinstance(res_json, dict) else {}
@@ -354,7 +408,6 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         if not offers:
             return "[]"
             
-        import json
         structured_offers = []
         for offer in offers[:6]:
             price_obj = offer.get("price", {})
@@ -379,14 +432,16 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
                         "stops": stops,
                         "price": str(price),
                         "currency": currency,
-                        "adults": adults,
-                        "children": children,
-                        "infants": infants,
+                        "adults": adults_cnt,
+                        "children": children_cnt,
+                        "infants": infants_cnt,
                         "raw_offer": offer
                     })
                     
+        print(f"✅ [Chatbot] Found {len(structured_offers)} structured flight offers")
         return json.dumps(structured_offers)
     except Exception as e:
+        print(f"❌ [Chatbot] Error in search_flights: {e}")
         return f"Error connecting to flight search service: {str(e)}"
 
 # Initialize Gemini Client
@@ -481,6 +536,34 @@ async def chat_endpoint(request: ChatRequest):
                     return [{"recipient_id": session_id, "text": rec_info}]
             except Exception as rec_err:
                 print(f"Error fetching recent bookings: {rec_err}")
+
+        # Direct intent handler for structured flight searches
+        flight_search_match = re.search(r'from\s+([A-Za-z]{3,25})\s+to\s+([A-Za-z]{3,25}).*?(\d{4}-\d{2}-\d{2})', user_message, re.IGNORECASE)
+        if flight_search_match:
+            try:
+                orig_raw = flight_search_match.group(1)
+                dest_raw = flight_search_match.group(2)
+                date_raw = flight_search_match.group(3)
+                print(f"✈️ Direct flight search triggered: {orig_raw} -> {dest_raw} on {date_raw}")
+                flight_json_res = search_flights(origin=orig_raw, destination=dest_raw, departure_date=date_raw)
+                if flight_json_res and flight_json_res != "[]" and not flight_json_res.startswith("Error") and not flight_json_res.startswith("Failed"):
+                    bot_text = f"Here are the available flight options from {resolve_iata(orig_raw)} to {resolve_iata(dest_raw)} on {date_raw}:\n\n```flight_options\n{flight_json_res}\n```"
+                    if db:
+                        try:
+                            db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
+                            db.add(db_bot_msg)
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    if redis_client:
+                        try:
+                            bot_msg_dict = {"role": "model", "message": bot_text, "created_at": datetime.utcnow().isoformat()}
+                            redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+                        except Exception:
+                            pass
+                    return [{"recipient_id": session_id, "text": bot_text}]
+            except Exception as direct_f_err:
+                print(f"Direct flight search error: {direct_f_err}")
 
         # Check if user message is asking about queue list or tickets in queue
         live_queue_context = ""
@@ -652,11 +735,9 @@ async def chat_endpoint(request: ChatRequest):
 
             # Initialize Chat session with history and tools
             models_to_try = [
-                'gemini-3.8-flash',
-                'gemini-3.5-flash-lite',
-                'gemini-2.5-flash',
                 'gemini-2.0-flash',
-                'gemini-1.5-flash'
+                'gemini-1.5-flash',
+                'gemini-2.5-flash'
             ]
             bot_text = None
             
@@ -679,8 +760,7 @@ async def chat_endpoint(request: ChatRequest):
                     break
                     
                 except Exception as api_err:
-                    print(f"Failed on {model_name}: {api_err}. Waiting 2s before trying next...")
-                    time.sleep(2)
+                    print(f"Failed on {model_name}: {api_err}. Trying next...")
                     continue
         
         if bot_text is None:
@@ -819,5 +899,5 @@ async def get_all_sessions():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
 
