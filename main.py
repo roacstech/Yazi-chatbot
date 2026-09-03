@@ -647,7 +647,13 @@ async def chat_endpoint(request: ChatRequest):
                     last_role = role
 
             # Initialize Chat session with history and tools
-            models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash']
+            models_to_try = [
+                'gemini-3.8-flash',
+                'gemini-3.5-flash-lite',
+                'gemini-2.5-flash',
+                'gemini-2.0-flash',
+                'gemini-1.5-flash'
+            ]
             bot_text = None
             
             for model_name in models_to_try:
