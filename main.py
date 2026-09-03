@@ -758,9 +758,9 @@ async def chat_endpoint(request: ChatRequest):
 
             # Initialize Chat session with history and tools
             models_to_try = [
-                'gemini-2.0-flash',
-                'gemini-1.5-flash',
-                'gemini-2.5-flash'
+                'gemini-3.6-flash',
+                'gemini-2.5-flash',
+                'gemini-1.5-flash'
             ]
             bot_text = None
             
