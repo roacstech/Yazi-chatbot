@@ -23,6 +23,10 @@ print("REDIS_URL =", os.getenv("REDIS_URL"))
 
 app = FastAPI(title="Yazi Chatbot API")
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Yazi Chatbot API is running live!"}
+
 # Setup Database Connection
 print("===== DEBUG ENV =====")
 print("MYSQL_URL:", os.environ.get("MYSQL_URL"))
