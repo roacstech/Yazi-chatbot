@@ -414,12 +414,14 @@ def extract_queue_info_from_message(user_message: str, userid: Optional[str] = N
             return None
     return None
 
+from typing import List, Optional, Any, Union
+
 class ChatRequest(BaseModel):
     message: str
-    senderId: str = "default"
-    auth: Optional[str] = None
-    roleid: Optional[str] = None
-    userid: Optional[str] = None
+    senderId: Optional[str] = "default"
+    auth: Optional[Any] = None
+    roleid: Optional[Union[str, int]] = None
+    userid: Optional[Union[str, int]] = None
 
 class RasaResponse(BaseModel):
     recipient_id: str
@@ -431,12 +433,13 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail="Gemini API Key is missing. Please configure it in .env")
 
     global _CURRENT_USER_ID
-    _CURRENT_USER_ID = request.userid
+    _CURRENT_USER_ID = str(request.userid) if request.userid is not None else None
 
     db = SessionLocal()
     try:
-        session_id = request.senderId
+        session_id = str(request.senderId or "default")
         user_message = request.message
+
         
         # Direct intent handler for recent booking inquiries (handles all singular/plural/flight variations)
         lower_user_msg = user_message.lower().strip()
@@ -623,7 +626,7 @@ async def chat_endpoint(request: ChatRequest):
                     last_role = role
 
             # Initialize Chat session with history and tools
-            models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
+            models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash']
             bot_text = None
             
             for model_name in models_to_try:
