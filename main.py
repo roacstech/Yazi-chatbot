@@ -305,14 +305,37 @@ AIRPORT_MAP = {
 }
 
 def resolve_iata(code_or_city: str) -> str:
+    """Resolves any 3-letter IATA code or city name worldwide to its proper IATA code."""
     if not code_or_city:
         return "MSP"
     val = str(code_or_city).strip().upper()
+    
+    # 1. Direct exact 3-letter IATA code check
+    if len(val) == 3 and val.isalpha():
+        return val
+
+    # 2. Fast lookup in common airport map
     if val in AIRPORT_MAP:
         return AIRPORT_MAP[val]
     for city, iata in AIRPORT_MAP.items():
         if city in val or val in city:
             return iata
+
+    # 3. Dynamic lookup via Backend Amadeus Airport Search API for any city worldwide
+    try:
+        search_url = f"{BACKEND_API_URL}/api/amadeus/airports/search"
+        resp = requests.get(search_url, params={"keyword": val, "limit": 1}, timeout=2)
+        if resp.status_code == 200:
+            res_data = resp.json()
+            airports = res_data.get("data", []) or res_data.get("airports", [])
+            if isinstance(airports, list) and len(airports) > 0:
+                first_code = airports[0].get("iataCode") or airports[0].get("iata_code") or airports[0].get("code")
+                if first_code and len(first_code) == 3:
+                    return first_code.upper()
+    except Exception:
+        pass
+
+    # 4. Fallback: extract any 3-letter uppercase token
     iata_match = re.search(r'\b([A-Za-z]{3})\b', val)
     if iata_match:
         return iata_match.group(1).upper()
