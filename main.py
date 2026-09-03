@@ -141,13 +141,15 @@ def get_agent_dashboard_stats() -> str:
 
 _CURRENT_USER_ID = None
 
+BACKEND_API_URL = os.getenv("BACKEND_API_URL") or os.getenv("NODE_API_URL") or "http://127.0.0.1:5000"
+
 def get_queue_list_status(queue_id: int = 8, userid: Optional[int] = None) -> str:
     """Queries the live Amadeus / Backend API to fetch real queue items and actual PNR count for a specific queue ID (e.g. Queue 8 for Ticketing Time Limits, Queue 5 for Ticketing Arrangements, Queue 0 for General Messages, Queue 2 for Schedule Changes, Queue 12 for Cancellations, Queue 23 for Quality Control). ALWAYS call this tool when user asks how many tickets/PNRs are in queue 8, queue 5, or any queue list."""
     try:
         global _CURRENT_USER_ID
         effective_userid = userid if userid is not None else _CURRENT_USER_ID
         q_id = int(queue_id)
-        url = f"http://127.0.0.1:5000/api/amadeus/flights/queues/{q_id}?category=0&max=250"
+        url = f"{BACKEND_API_URL}/api/amadeus/flights/queues/{q_id}?category=0&max=250"
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             res_data = response.json()
@@ -226,52 +228,53 @@ def format_pretty_date(d_val) -> str:
 
 def get_recent_agent_bookings(limit: int = 3) -> str:
     """Queries the database to retrieve the travel agent's most recent flight bookings and trip details (PNR, status, route, departure date, total price). ALWAYS CALL THIS TOOL whenever the user asks for 'my last booking', 'last booking details', 'my recent bookings', 'show my bookings', 'recent trips', 'my trips', or 'my bookings'."""
-    db = SessionLocal()
     try:
-        user_id = globals().get('_CURRENT_USER_ID')
-        base_filter = f"agent_userid = '{user_id}'" if user_id else "1=1"
-        
-        query_str = f"SELECT id, pnr, status, origin_iata, destination_iata, departure_date, created_at, total, currency FROM bookings WHERE {base_filter} ORDER BY id DESC LIMIT {int(limit)}"
-        result = db.execute(text(query_str)).fetchall()
-        
-        if not result:
-            return "No recent flight bookings found for your agent account."
+        db = SessionLocal()
+        try:
+            user_id = globals().get('_CURRENT_USER_ID')
+            base_filter = f"agent_userid = '{user_id}'" if user_id else "1=1"
             
-        recent_list = []
-        text_lines = []
-        for row in result:
-            b_id, pnr, status, orig, dest, dep_date, created_at, total, curr = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
-            pnr_str = pnr or "N/A"
-            status_str = (status or "Held").upper()
-            orig_str = orig or ""
-            dest_str = dest or ""
-            dep_date_str = format_pretty_date(dep_date)
-            booked_on_str = format_pretty_date(created_at)
-            total_str = f"{total}" if total is not None else "0.00"
-            curr_str = curr or "USD"
+            query_str = f"SELECT id, pnr, status, origin_iata, destination_iata, departure_date, created_at, total, currency FROM bookings WHERE {base_filter} ORDER BY id DESC LIMIT {int(limit)}"
+            result = db.execute(text(query_str)).fetchall()
             
-            recent_list.append({
-                "id": b_id,
-                "pnr": pnr_str,
-                "status": status_str,
-                "origin": orig_str,
-                "destination": dest_str,
-                "departure_date": dep_date_str,
-                "booked_on": booked_on_str,
-                "total": total_str,
-                "currency": curr_str
-            })
-            text_lines.append(f"- **PNR**: `{pnr_str}` | **Status**: `{status_str}` | **Route**: {orig_str} ✈️ {dest_str} (Departure: {dep_date_str} • Booked: {booked_on_str}) | **Total**: ${total_str} {curr_str}")
-            
-        json_block = json.dumps(recent_list)
-        return (
-            f"Here are your {len(recent_list)} most recent flight booking details:\n\n"
-            f"```recent_bookings\n{json_block}\n```"
-        )
+            if not result:
+                return "No recent flight bookings found for your agent account."
+                
+            recent_list = []
+            text_lines = []
+            for row in result:
+                b_id, pnr, status, orig, dest, dep_date, created_at, total, curr = row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
+                pnr_str = pnr or "N/A"
+                status_str = (status or "Held").upper()
+                orig_str = orig or ""
+                dest_str = dest or ""
+                dep_date_str = format_pretty_date(dep_date)
+                booked_on_str = format_pretty_date(created_at)
+                total_str = f"{total}" if total is not None else "0.00"
+                curr_str = curr or "USD"
+                
+                recent_list.append({
+                    "id": b_id,
+                    "pnr": pnr_str,
+                    "status": status_str,
+                    "origin": orig_str,
+                    "destination": dest_str,
+                    "departure_date": dep_date_str,
+                    "booked_on": booked_on_str,
+                    "total": total_str,
+                    "currency": curr_str
+                })
+                text_lines.append(f"- **PNR**: `{pnr_str}` | **Status**: `{status_str}` | **Route**: {orig_str} ✈️ {dest_str} (Departure: {dep_date_str} • Booked: {booked_on_str}) | **Total**: ${total_str} {curr_str}")
+                
+            json_block = json.dumps(recent_list)
+            return (
+                f"Here are your {len(recent_list)} most recent flight booking details:\n\n"
+                f"```recent_bookings\n{json_block}\n```"
+            )
+        finally:
+            db.close()
     except Exception as e:
         return f"Error retrieving recent bookings: {str(e)}"
-    finally:
-        db.close()
 
 def search_flights(origin: str, destination: str, departure_date: str, return_date: str = None, adults: int = 1, children: int = 0, infants: int = 0) -> str:
     """Searches for available flights between two locations on specific dates. 
@@ -292,7 +295,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         iata_dest_match = re.search(r'\b([A-Za-z]{3})\b', str(destination))
         destination = iata_dest_match.group(1).upper() if iata_dest_match else re.sub(r'[^A-Za-z]', '', str(destination))[-3:].upper()
 
-        url = "http://127.0.0.1:5000/api/amadeus/flights/flight-offers"
+        url = f"{BACKEND_API_URL}/api/amadeus/flights/flight-offers"
         
         adults = int(adults)
         children = int(children)
@@ -433,12 +436,16 @@ async def chat_endpoint(request: ChatRequest):
     global _CURRENT_USER_ID
     _CURRENT_USER_ID = str(request.userid) if request.userid is not None else None
 
-    db = SessionLocal()
+    db = None
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        print(f"Warning: Could not create DB session: {e}")
+
     try:
         session_id = str(request.senderId or "default")
         user_message = request.message
 
-        
         # Direct intent handler for recent booking inquiries (handles all singular/plural/flight variations)
         lower_user_msg = user_message.lower().strip()
         recent_booking_phrases = [
@@ -454,12 +461,19 @@ async def chat_endpoint(request: ChatRequest):
             try:
                 rec_info = get_recent_agent_bookings(limit=3)
                 if rec_info:
-                    db_bot_msg = ChatHistory(session_id=session_id, role="model", message=rec_info)
-                    db.add(db_bot_msg)
-                    db.commit()
+                    if db:
+                        try:
+                            db_bot_msg = ChatHistory(session_id=session_id, role="model", message=rec_info)
+                            db.add(db_bot_msg)
+                            db.commit()
+                        except Exception:
+                            db.rollback()
                     if redis_client:
-                        bot_msg_dict = {"role": "model", "message": rec_info, "created_at": datetime.utcnow().isoformat()}
-                        redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+                        try:
+                            bot_msg_dict = {"role": "model", "message": rec_info, "created_at": datetime.utcnow().isoformat()}
+                            redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+                        except Exception:
+                            pass
                     return [{"recipient_id": session_id, "text": rec_info}]
             except Exception as rec_err:
                 print(f"Error fetching recent bookings: {rec_err}")
@@ -476,18 +490,27 @@ async def chat_endpoint(request: ChatRequest):
                 )
         
         # Save user message and fetch history
+        history = []
         if redis_client:
-            user_msg_dict = {"role": "user", "message": user_message, "created_at": datetime.utcnow().isoformat()}
-            redis_client.rpush(f"chat_session:{session_id}", json.dumps(user_msg_dict))
-            redis_client.ltrim(f"chat_session:{session_id}", -40, -1)
-            redis_client.expire(f"chat_session:{session_id}", 86400)
-            
-            raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
-            history = [json.loads(msg) for msg in raw_history]
-        else:
-            history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(20).all()
-            history_objs.reverse()
-            history = [{"role": msg.role, "message": msg.message} for msg in history_objs]
+            try:
+                user_msg_dict = {"role": "user", "message": user_message, "created_at": datetime.utcnow().isoformat()}
+                redis_client.rpush(f"chat_session:{session_id}", json.dumps(user_msg_dict))
+                redis_client.ltrim(f"chat_session:{session_id}", -40, -1)
+                redis_client.expire(f"chat_session:{session_id}", 86400)
+                
+                raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
+                history = [json.loads(msg) for msg in raw_history]
+            except Exception as red_err:
+                print(f"Redis error: {red_err}")
+                history = []
+        elif db:
+            try:
+                history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(20).all()
+                history_objs.reverse()
+                history = [{"role": msg.role, "message": msg.message} for msg in history_objs]
+            except Exception as db_err:
+                print(f"DB history error: {db_err}")
+                history = []
 
         # Check for simple greetings/casual chat first
         GREETINGS = {"hi", "hello", "hey", "hlo", "hi there", "hello yazi", "good morning", "good afternoon", "good evening", "greetings", "help"}
@@ -654,14 +677,22 @@ async def chat_endpoint(request: ChatRequest):
             bot_text = "I'm currently busy due to high demand. Please wait a moment and try again."
         
         # Save bot response to DB (Permanent storage)
-        db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
-        db.add(db_bot_msg)
-        db.commit()
+        if db:
+            try:
+                db_bot_msg = ChatHistory(session_id=session_id, role="model", message=bot_text)
+                db.add(db_bot_msg)
+                db.commit()
+            except Exception as db_save_err:
+                print(f"Warning: Could not save message to DB: {db_save_err}")
+                db.rollback()
         
         # Save bot response to Redis
         if redis_client:
-            bot_msg_dict = {"role": "model", "message": bot_text, "created_at": datetime.utcnow().isoformat()}
-            redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+            try:
+                bot_msg_dict = {"role": "model", "message": bot_text, "created_at": datetime.utcnow().isoformat()}
+                redis_client.rpush(f"chat_session:{session_id}", json.dumps(bot_msg_dict))
+            except Exception:
+                pass
 
         return [{"recipient_id": session_id, "text": bot_text}]
         
@@ -671,43 +702,67 @@ async def chat_endpoint(request: ChatRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to process chat request: {str(e)}")
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 @app.get("/api/chat/history/{session_id}")
 async def get_chat_history(session_id: str):
-    db = SessionLocal()
-    try:
-        history = []
-        if redis_client:
+    history = []
+    if redis_client:
+        try:
             raw_history = redis_client.lrange(f"chat_session:{session_id}", 0, -1)
             if raw_history:
                 history = [json.loads(msg) for msg in raw_history]
-                
-        if not history:
+        except Exception:
+            pass
+            
+    if not history:
+        db = None
+        try:
+            db = SessionLocal()
             history_objs = db.query(ChatHistory).filter(ChatHistory.session_id == session_id).order_by(ChatHistory.id.desc()).limit(40).all()
             history_objs.reverse()
             history = [{"role": msg.role, "message": msg.message, "created_at": str(msg.created_at)} for msg in history_objs]
-            
-        return {"success": True, "history": history}
-    finally:
-        db.close()
+        except Exception as e:
+            print(f"History fetch error: {e}")
+            history = []
+        finally:
+            if db:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        
+    return {"success": True, "history": history}
 
 
 @app.delete("/api/chat/history/{session_id}")
 async def delete_chat_history(session_id: str):
     if redis_client:
-        redis_client.delete(f"chat_session:{session_id}")
+        try:
+            redis_client.delete(f"chat_session:{session_id}")
+        except Exception:
+            pass
         
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         db.execute(text(f"DELETE FROM chat_histories WHERE session_id='{session_id}'"))
         db.commit()
         return {"success": True, "message": "Deleted from history"}
     except Exception as e:
-        db.rollback()
+        if db:
+            db.rollback()
         return {"success": False, "error": str(e)}
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 @app.get("/api/chat/sessions")
 async def get_all_sessions():
@@ -715,17 +770,21 @@ async def get_all_sessions():
     seen_ids = set()
     
     if redis_client:
-        keys = redis_client.keys("chat_session:*")
-        for key in keys:
-            session_id = key.replace("chat_session:", "")
-            raw = redis_client.lindex(key, 0)
-            if raw:
-                msg = json.loads(raw)
-                sessions.append({"id": session_id, "preview": msg.get("message", "")[:40] + "...", "timestamp": msg.get("created_at")})
-                seen_ids.add(session_id)
-                
-    db = SessionLocal()
+        try:
+            keys = redis_client.keys("chat_session:*")
+            for key in keys:
+                session_id = key.replace("chat_session:", "")
+                raw = redis_client.lindex(key, 0)
+                if raw:
+                    msg = json.loads(raw)
+                    sessions.append({"id": session_id, "preview": msg.get("message", "")[:40] + "...", "timestamp": msg.get("created_at")})
+                    seen_ids.add(session_id)
+        except Exception:
+            pass
+            
+    db = None
     try:
+        db = SessionLocal()
         result = db.execute(text("SELECT session_id, MIN(created_at) as timestamp FROM chat_histories GROUP BY session_id ORDER BY timestamp DESC LIMIT 50"))
         for row in result:
             s_id = row[0]
@@ -739,11 +798,16 @@ async def get_all_sessions():
         sessions.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
         return {"success": True, "sessions": sessions}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"success": True, "sessions": sessions}
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
             
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8001)
+
