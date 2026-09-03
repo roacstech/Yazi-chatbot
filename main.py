@@ -33,7 +33,7 @@ MYSQL_URL = os.environ.get("MYSQL_URL")
 if not MYSQL_URL:
     raise ValueError("MYSQL_URL is not set in environment variables.")
 
-engine = create_engine(MYSQL_URL)
+engine = create_engine(MYSQL_URL, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -43,22 +43,15 @@ print("========== REDIS DEBUG ==========")
 print("REDIS_URL =", REDIS_URL)
 print("=================================")
 
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
-    print("Connected to Redis successfully.")
-except Exception as e:
-    print(f"Failed to connect to Redis: {e}")
-    redis_client = None
-
-    
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
-    print("Connected to Redis successfully.")
-except Exception as e:
-    print(f"Failed to connect to Redis: {e}")
-    redis_client = None
+redis_client = None
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        print("Connected to Redis successfully.")
+    except Exception as e:
+        print(f"Failed to connect to Redis: {e}")
+        redis_client = None
 
 class ChatHistory(Base):
     __tablename__ = "chat_histories"
@@ -79,8 +72,13 @@ class Booking(Base):
     total = Column(String(50)) # Keeping simple as String
     currency = Column(String(3))
 
-# Auto-create tables if they don't exist
-Base.metadata.create_all(bind=engine)
+# Auto-create tables if they don't exist (safe startup)
+try:
+    Base.metadata.create_all(bind=engine)
+    print("MySQL database tables verified/created successfully.")
+except Exception as db_init_err:
+    print(f"Warning: Could not connect to MySQL at startup: {db_init_err}")
+
 
 def get_pnr_status(pnr: str) -> str:
     """Queries the database to get the flight booking status for a given PNR."""
