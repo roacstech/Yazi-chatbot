@@ -20,6 +20,7 @@ load_dotenv()
 
 print("MYSQL_URL =", os.getenv("MYSQL_URL"))
 print("REDIS_URL =", os.getenv("REDIS_URL"))
+print("BACKEND_API_URL =", os.getenv("BACKEND_API_URL"))
 
 app = FastAPI(title="Yazi Chatbot API")
 
@@ -115,7 +116,7 @@ def get_agent_dashboard_stats() -> str:
         # Today's sales calculation matching Node API
         sales_val = db.execute(text(
             f"SELECT SUM(CAST(total AS DECIMAL(10,2)) + CAST(COALESCE(price_adjustment, 0) AS DECIMAL(10,2))) "
-            f"FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed') AND DATE(held_at) = CURDATE() AND {base_filter}"
+            f"FROM bookings WHERE LOWER(status) IN ('ticketed', 'confirmed') AND DATE(COALESCE(processed_at, updated_at, held_at)) = CURDATE() AND {base_filter}"
         )).scalar()
         today_sales = float(sales_val) if sales_val is not None else 0.0
         
@@ -143,7 +144,7 @@ def get_agent_dashboard_stats() -> str:
 
 _CURRENT_USER_ID = None
 
-BACKEND_API_URL = os.getenv("BACKEND_API_URL") or os.getenv("NODE_API_URL") or "http://127.0.0.1:5000"
+BACKEND_API_URL = (os.getenv("BACKEND_API_URL") or os.getenv("NODE_API_URL") or "http://127.0.0.1:5000").rstrip("/")
 
 def get_queue_list_status(queue_id: int = 8, userid: Optional[int] = None) -> str:
     """Queries the live Amadeus / Backend API to fetch real queue items and actual PNR count for a specific queue ID (e.g. Queue 8 for Ticketing Time Limits, Queue 5 for Ticketing Arrangements, Queue 0 for General Messages, Queue 2 for Schedule Changes, Queue 12 for Cancellations, Queue 23 for Quality Control). ALWAYS call this tool when user asks how many tickets/PNRs are in queue 8, queue 5, or any queue list."""
@@ -464,7 +465,7 @@ def search_flights(origin: str, destination: str, departure_date: str, return_da
         print(f"✅ [Chatbot] Found {len(structured_offers)} structured flight offers")
         return json.dumps(structured_offers)
     except Exception as e:
-        print(f"❌ [Chatbot] Error in search_flights: {e}")
+        print(f"❌ [Chatbot] Error in search_flights connecting to {url if 'url' in locals() else BACKEND_API_URL}: {e}")
         return f"Error connecting to flight search service: {str(e)}"
 
 # Initialize Gemini Client
